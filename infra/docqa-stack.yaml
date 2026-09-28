@@ -1,0 +1,640 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Document Q&A app: VPC (no NAT, all tasks public-IP), RDS pgvector, S3, ECS Fargate
+  (api, worker, frontend services + a one-off migrate task definition), two ALBs.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: docqa
+  BucketName:
+    Type: String
+    Description: Globally-unique S3 bucket name. Must start with the ProjectName value.
+  DbMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    AllowedPattern: "^[A-Za-z0-9]+$"
+    Description: Letters and numbers only (used inside a connection URL).
+  LlamaBaseUrl:
+    Type: String
+    Description: e.g. https://api.together.xyz/v1
+  LlamaModel:
+    Type: String
+  LlamaApiKey:
+    Type: String
+    NoEcho: true
+  OpenAiApiKey:
+    Type: String
+    NoEcho: true
+  OpenAiModel:
+    Type: String
+    Default: gpt-4o-mini
+  LangsmithApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+  LangsmithProject:
+    Type: String
+    Default: docqa-backend
+  InternalApiToken:
+    Type: String
+    NoEcho: true
+  BackendImage:
+    Type: String
+    Description: Full ECR image URI for the backend (e.g. ACCOUNT.dkr.ecr.REGION.amazonaws.com/docqa-backend:1)
+  FrontendImage:
+    Type: String
+    Description: Full ECR image URI for the frontend
+
+Conditions:
+  HasLangsmith: !Not [!Equals [!Ref LangsmithApiKey, ""]]
+
+Resources:
+  # ------------------------------------------------------------------ networking
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-vpc"}]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-igw"}]
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-public-a"}]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-public-b"}]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-private-a"}]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-private-b"}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-public-rt"}]
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable}
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable}
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-private-rt"}]
+      # No NAT route on purpose (Option 3: RDS/internal-ALB only, no outbound needed here).
+
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable}
+  PrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable}
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PublicRouteTable, !Ref PrivateRouteTable]
+
+  # ------------------------------------------------------------------ security groups
+  FrontendAlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internet-facing frontend ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-frontend-alb"}]
+
+  StreamlitSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Streamlit tasks
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-streamlit"}]
+
+  StreamlitIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref StreamlitSg
+      IpProtocol: tcp
+      FromPort: 8501
+      ToPort: 8501
+      SourceSecurityGroupId: !Ref FrontendAlbSg
+
+  BackendAlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal backend ALB
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-backend-alb"}]
+
+  BackendAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendAlbSg
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref StreamlitSg
+
+  ApiSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: FastAPI tasks
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-api"}]
+
+  ApiIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ApiSg
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !Ref BackendAlbSg
+
+  WorkerSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Worker tasks (outbound only, no inbound rules)
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-worker"}]
+
+  RdsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS Postgres
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-rds"}]
+
+  RdsIngressApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: {GroupId: !Ref RdsSg, IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref ApiSg}
+  RdsIngressWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: {GroupId: !Ref RdsSg, IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref WorkerSg}
+
+  # ------------------------------------------------------------------ S3
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-sessions
+            Status: Enabled
+            Prefix: sessions/
+            ExpirationInDays: 2
+
+  # ------------------------------------------------------------------ RDS
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-db"
+      Engine: postgres
+      EngineVersion: "16.15"
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      DBName: docqa
+      MasterUsername: docqa_admin
+      MasterUserPassword: !Ref DbMasterPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSg]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      StorageEncrypted: true
+
+  # ------------------------------------------------------------------ secrets
+  DatabaseUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/DATABASE_URL"
+      SecretString: !Sub "postgresql://docqa_admin:${DbMasterPassword}@${Database.Endpoint.Address}:5432/docqa?sslmode=require"
+
+  LlamaKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: {Name: !Sub "${ProjectName}/LLAMA_API_KEY", SecretString: !Ref LlamaApiKey}
+
+  OpenAiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: {Name: !Sub "${ProjectName}/OPENAI_API_KEY", SecretString: !Ref OpenAiApiKey}
+
+  LangsmithKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasLangsmith
+    Properties: {Name: !Sub "${ProjectName}/LANGSMITH_API_KEY", SecretString: !Ref LangsmithApiKey}
+
+  InternalTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: {Name: !Sub "${ProjectName}/INTERNAL_API_TOKEN", SecretString: !Ref InternalApiToken}
+
+  # ------------------------------------------------------------------ IAM
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ecsTaskExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-project-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DatabaseUrlSecret
+                  - !Ref LlamaKeySecret
+                  - !Ref OpenAiKeySecret
+                  - !Ref InternalTokenSecret
+                  - !If [HasLangsmith, !Ref LangsmithKeySecret, !Ref "AWS::NoValue"]
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: s3-session-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "arn:aws:s3:::${BucketName}/sessions/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${BucketName}"
+
+  # ------------------------------------------------------------------ logs
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/ecs/${ProjectName}-api", RetentionInDays: 14}
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/ecs/${ProjectName}-worker", RetentionInDays: 14}
+  MigrateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/ecs/${ProjectName}-migrate", RetentionInDays: 14}
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/ecs/${ProjectName}-frontend", RetentionInDays: 14}
+
+  # ------------------------------------------------------------------ ECS cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+
+  # Shared env/secrets blocks are repeated per task def (CFN has no YAML anchors on deploy).
+  ApiTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-api"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref BackendImage
+          Essential: true
+          PortMappings: [{ContainerPort: 8000, Protocol: tcp}]
+          Environment:
+            - {Name: ENV, Value: prod}
+            - {Name: S3_BUCKET, Value: !Ref BucketName}
+            - {Name: AWS_REGION, Value: !Ref "AWS::Region"}
+            - {Name: LLAMA_BASE_URL, Value: !Ref LlamaBaseUrl}
+            - {Name: LLAMA_MODEL, Value: !Ref LlamaModel}
+            - {Name: OPENAI_MODEL, Value: !Ref OpenAiModel}
+            - {Name: LANGSMITH_TRACING, Value: !If [HasLangsmith, "true", "false"]}
+            - {Name: LANGSMITH_PROJECT, Value: !Ref LangsmithProject}
+            - {Name: LANGSMITH_HIDE_INPUTS, Value: "true"}
+            - {Name: LANGSMITH_HIDE_OUTPUTS, Value: "true"}
+            - {Name: DB_POOL_MAX, Value: "5"}
+          Secrets:
+            - {Name: DATABASE_URL, ValueFrom: !Ref DatabaseUrlSecret}
+            - {Name: LLAMA_API_KEY, ValueFrom: !Ref LlamaKeySecret}
+            - {Name: OPENAI_API_KEY, ValueFrom: !Ref OpenAiKeySecret}
+            - {Name: INTERNAL_API_TOKEN, ValueFrom: !Ref InternalTokenSecret}
+            - !If
+              - HasLangsmith
+              - {Name: LANGSMITH_API_KEY, ValueFrom: !Ref LangsmithKeySecret}
+              - !Ref "AWS::NoValue"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: api
+
+  WorkerTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-worker"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Ref BackendImage
+          Command: ["python", "-m", "app.worker"]
+          Essential: true
+          StopTimeout: 120
+          Environment:
+            - {Name: ENV, Value: prod}
+            - {Name: S3_BUCKET, Value: !Ref BucketName}
+            - {Name: AWS_REGION, Value: !Ref "AWS::Region"}
+            - {Name: LLAMA_BASE_URL, Value: !Ref LlamaBaseUrl}
+            - {Name: LLAMA_MODEL, Value: !Ref LlamaModel}
+            - {Name: OPENAI_MODEL, Value: !Ref OpenAiModel}
+            - {Name: LANGSMITH_TRACING, Value: !If [HasLangsmith, "true", "false"]}
+            - {Name: LANGSMITH_PROJECT, Value: !Ref LangsmithProject}
+            - {Name: LANGSMITH_HIDE_INPUTS, Value: "true"}
+            - {Name: LANGSMITH_HIDE_OUTPUTS, Value: "true"}
+            - {Name: DB_POOL_MAX, Value: "5"}
+            - {Name: WORKER_CONCURRENCY, Value: "2"}
+          Secrets:
+            - {Name: DATABASE_URL, ValueFrom: !Ref DatabaseUrlSecret}
+            - {Name: LLAMA_API_KEY, ValueFrom: !Ref LlamaKeySecret}
+            - {Name: OPENAI_API_KEY, ValueFrom: !Ref OpenAiKeySecret}
+            - {Name: INTERNAL_API_TOKEN, ValueFrom: !Ref InternalTokenSecret}
+            - !If
+              - HasLangsmith
+              - {Name: LANGSMITH_API_KEY, ValueFrom: !Ref LangsmithKeySecret}
+              - !Ref "AWS::NoValue"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: worker
+
+  MigrateTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-migrate"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: migrate
+          Image: !Ref BackendImage
+          Command: ["python", "-m", "app.migrate"]
+          Essential: true
+          Environment:
+            - {Name: ENV, Value: prod}
+            - {Name: S3_BUCKET, Value: !Ref BucketName}
+            - {Name: AWS_REGION, Value: !Ref "AWS::Region"}
+            - {Name: LLAMA_BASE_URL, Value: !Ref LlamaBaseUrl}
+            - {Name: LLAMA_MODEL, Value: !Ref LlamaModel}
+            - {Name: OPENAI_MODEL, Value: !Ref OpenAiModel}
+          Secrets:
+            - {Name: DATABASE_URL, ValueFrom: !Ref DatabaseUrlSecret}
+            - {Name: LLAMA_API_KEY, ValueFrom: !Ref LlamaKeySecret}
+            - {Name: OPENAI_API_KEY, ValueFrom: !Ref OpenAiKeySecret}
+            - {Name: INTERNAL_API_TOKEN, ValueFrom: !Ref InternalTokenSecret}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref MigrateLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: migrate
+
+  FrontendTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-frontend"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Ref FrontendImage
+          Essential: true
+          PortMappings: [{ContainerPort: 8501, Protocol: tcp}]
+          Environment:
+            - {Name: BACKEND_URL, Value: !Sub "http://${BackendAlb.DNSName}"}
+          Secrets:
+            - {Name: INTERNAL_API_TOKEN, ValueFrom: !Ref InternalTokenSecret}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: frontend
+
+  # ------------------------------------------------------------------ load balancers
+  BackendAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-backend-alb"
+      Scheme: internal
+      Type: application
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroups: [!Ref BackendAlbSg]
+
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-api-tg"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8000
+      VpcId: !Ref Vpc
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+
+  BackendListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref BackendAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref ApiTargetGroup}]
+
+  FrontendAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-frontend-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref FrontendAlbSg]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: "120"}
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-frontend-tg"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8501
+      VpcId: !Ref Vpc
+      HealthCheckPath: /_stcore/health
+      HealthCheckIntervalSeconds: 15
+      TargetGroupAttributes:
+        - {Key: stickiness.enabled, Value: "true"}
+        - {Key: stickiness.type, Value: lb_cookie}
+        - {Key: stickiness.lb_cookie.duration_seconds, Value: "86400"}
+
+  FrontendListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref FrontendAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref FrontendTargetGroup}]
+
+  # ------------------------------------------------------------------ services
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: BackendListener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-api"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref ApiTaskDef
+      DesiredCount: 2
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref ApiSg]
+      LoadBalancers:
+        - {ContainerName: api, ContainerPort: 8000, TargetGroupArn: !Ref ApiTargetGroup}
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${ProjectName}-worker"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref WorkerTaskDef
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref WorkerSg]
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: FrontendListener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-frontend"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref FrontendTaskDef
+      DesiredCount: 2
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref StreamlitSg]
+      LoadBalancers:
+        - {ContainerName: frontend, ContainerPort: 8501, TargetGroupArn: !Ref FrontendTargetGroup}
+
+Outputs:
+  FrontendUrl:
+    Value: !Sub "http://${FrontendAlb.DNSName}"
+  BackendInternalUrl:
+    Value: !Sub "http://${BackendAlb.DNSName}"
+  ClusterName:
+    Value: !Ref Cluster
+  MigrateTaskDefArn:
+    Value: !Ref MigrateTaskDef
+  ApiSecurityGroupId:
+    Value: !Ref ApiSg
+  PublicSubnetIds:
+    Value: !Sub "${PublicSubnetA},${PublicSubnetB}"
